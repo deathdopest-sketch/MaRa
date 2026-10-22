@@ -2,6 +2,8 @@
 
 // she knows exactly who's who. and she never forgets.
 
+const { think, DWELL_MS } = require('./MaraVoice');
+
 const C = {
   r    : '\x1b[0m',
   dim  : '\x1b[2m',
@@ -97,6 +99,12 @@ class Dashboard {
     this._feed      = new Map();
     this._interval  = null;
     this._refreshMs = opts.refreshMs || 2000;
+
+    // commentary
+    this._chat        = [];      // [{ ts, nick, text }] — mara's thoughts
+    this._dwellStart  = Date.now();
+    this._commented   = false;   // true once she's spoken about current user
+    this._thinking    = false;   // prevent concurrent LLM calls
   }
 
   addRoom(room) {
@@ -121,16 +129,18 @@ class Dashboard {
       process.stdin.setEncoding('utf8');
       process.stdin.on('data', key => {
         if (key === '\x03' || key === 'q') process.emit('SIGINT');
-        if (key === '\x1b[A') { this._userIdx = Math.max(0, this._userIdx - 1); this._draw(); }
-        if (key === '\x1b[B') { this._userIdx++; this._draw(); }
+        if (key === '\x1b[A') { this._userIdx = Math.max(0, this._userIdx - 1); this._resetDwell(); this._draw(); }
+        if (key === '\x1b[B') { this._userIdx++; this._resetDwell(); this._draw(); }
         if (key === '\t' || key === '\x1b[C') {
           this._roomIdx = (this._roomIdx + 1) % Math.max(1, this._rooms.length);
           this._userIdx = 0;
+          this._resetDwell();
           this._draw();
         }
         if (key === '\x1b[D') {
           this._roomIdx = (this._roomIdx - 1 + this._rooms.length) % Math.max(1, this._rooms.length);
           this._userIdx = 0;
+          this._resetDwell();
           this._draw();
         }
       });
@@ -138,7 +148,7 @@ class Dashboard {
 
     process.stdout.on('resize', () => this._draw());
     this._draw();
-    this._interval = setInterval(() => this._draw(), this._refreshMs);
+    this._interval = setInterval(() => { this._checkDwell(); this._draw(); }, this._refreshMs);
   }
 
   stop() {
@@ -147,6 +157,38 @@ class Dashboard {
     if (process.stdin.isTTY) {
       try { process.stdin.setRawMode(false); } catch (_) {}
     }
+  }
+
+  _resetDwell() {
+    this._dwellStart = Date.now();
+    this._commented  = false;
+  }
+
+  _checkDwell() {
+    if (this._commented || this._thinking) return;
+    if (Date.now() - this._dwellStart < DWELL_MS) return;
+    const room    = this._room();
+    const allProf = room ? this._prof.getAllProfiles(room) : [];
+    const sel     = allProf[this._userIdx] || null;
+    if (!sel) return;
+    this._commented = true;
+    this._triggerCommentary(sel, room);
+  }
+
+  _triggerCommentary(p, room) {
+    if (this._thinking) return;
+    this._thinking = true;
+    const social = this._social?.narrative(room, p.nick) || null;
+    const mood   = this._mood.getTone(room);
+    think(p, social, `${room} — room tone: ${mood}`)
+      .then(text => {
+        if (text) {
+          this._chat.push({ ts: Date.now(), nick: p.nick, text });
+          if (this._chat.length > 20) this._chat.shift();
+        }
+      })
+      .catch(() => {})
+      .finally(() => { this._thinking = false; });
   }
 
   _room() {
@@ -161,9 +203,11 @@ class Dashboard {
 
     // Fixed-height sections:
     //   3 header lines + 1 divider = 4
-    //   1 feed divider + FEED_H feed rows + 1 box bottom + 1 hint = FEED_H + 3
-    const FEED_H   = 5;
-    const FIXED    = 4 + FEED_H + 3;
+    //   1 feed divider + FEED_H feed rows = FEED_H + 1
+    //   1 mara divider + MARA_H mara rows + 1 box bottom + 1 hint = MARA_H + 3
+    const FEED_H   = 4;
+    const MARA_H   = 3;
+    const FIXED    = 4 + FEED_H + 1 + MARA_H + 3;
     const PANEL_H  = Math.max(6, rows - FIXED);
 
     const room = this._room();
@@ -220,6 +264,26 @@ class Dashboard {
         const row = `  ${C.dim}${ts}${C.r}  ${C.cyn}${f.nick.slice(0, 14).padEnd(14)}${C.r}  ${f.text}`;
         out.push(`${C.dim}║${C.r}${padVis(row, W)}${C.dim}║${C.r}`);
       }
+    }
+
+    // ── mara commentary ───────────────────────────────────────────────────────
+    out.push(`${C.dim}╠${'═'.repeat(W)}╣${C.r}`);
+    const recentChat = this._chat.slice(-MARA_H);
+    while (recentChat.length < MARA_H) recentChat.unshift(null);
+
+    for (const c of recentChat) {
+      if (!c) {
+        // empty slot — show hint on first empty if nothing has been said yet
+        const isEmpty = this._chat.length === 0;
+        const hintTxt = isEmpty
+          ? `  ${C.dim}☠  pause on a user for ${Math.round(DWELL_MS / 1000)}s — mara will tell you what she thinks${C.r}`
+          : '';
+        out.push(`${C.dim}║${C.r}${padVis(hintTxt, W)}${C.dim}║${C.r}`);
+        continue;
+      }
+      const ago = relAge(c.ts);
+      const row = `  ${C.mag}☠${C.r}  ${C.dim}${ago}${C.r}  ${C.bold}${c.nick}${C.r}  ${C.dim}${c.text}${C.r}`;
+      out.push(`${C.dim}║${C.r}${padVis(row, W)}${C.dim}║${C.r}`);
     }
 
     out.push(`${C.dim}╚${'═'.repeat(W)}╝${C.r}`);
