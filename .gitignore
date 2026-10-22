@@ -1,0 +1,7 @@
+node_modules/
+.env
+data/
+*.log
+vulnscan_reports/
+lilly-chatcommon-build/
+vita/
