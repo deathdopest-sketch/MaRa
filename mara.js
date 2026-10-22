@@ -63,6 +63,14 @@ function makeMumbleAdapter() {
   return new MumbleAdapter(server, key, rooms);
 }
 
+function makeStumbleAdapter() {
+  const StumbleChatAdapter = require('./src/StumbleChatAdapter');
+  const cdpPort = process.env.CHROME_CDP_PORT || '9222';
+  const rooms   = (process.env.STUMBLECHAT_ROOMS || '')
+    .split(',').map(r => r.trim().toLowerCase()).filter(Boolean);
+  return new StumbleChatAdapter(cdpPort, rooms);
+}
+
 // ── Wire adapter events → analyzers ──────────────────────────────────────────
 
 function wireAdapter(adapter) {
@@ -142,6 +150,13 @@ async function main() {
     wireAdapter(mc);
     adapters.push(mc);
     await mc.connect();
+  }
+
+  if (PLATFORM === 'stumblechat' || PLATFORM === 'stumble') {
+    const sc = makeStumbleAdapter();
+    wireAdapter(sc);
+    adapters.push(sc);
+    await sc.connect();
   }
 
   if (!adapters.length) {
