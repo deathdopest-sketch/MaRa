@@ -21,7 +21,7 @@ class AudioCapture extends EventEmitter {
 
   async preNavigate() {
     await this._page.evaluateOnNewDocument(() => {
-      window._maraLastSubscribe = null;    // { handle, nick, ts }
+      window._maraSubscribeQueue = [];     // FIFO: { handle, nick, ts } — one entry per broadcaster
       window._maraTrackOwners   = {};      // trackId → { handle, nick }
       window._maraAudioNodes    = [];      // keep ctx/src/proc alive — prevents GC
       window._maraChunkQueue    = [];      // buffer chunks until Node callback is ready
@@ -114,26 +114,35 @@ class AudioCapture extends EventEmitter {
         }
       };
 
-      const watchPC = (pc) => {
+      const watchPC = (pc, pcOwner) => {
+        // pcOwner is bound at PC-creation time, not at track-arrival time.
+        // This prevents a stale subscribe event from a different user
+        // (e.g. the room owner who has a permanent stream) bleeding onto
+        // someone else's audio track that arrives seconds later.
         pc.addEventListener('track', (evt) => {
           if (evt.track.kind !== 'audio') return;
           const stream = evt.streams[0] || new MediaStream([evt.track]);
-
-          // attribution: subscribe WS event injects handle+nick within 8s before track
-          const sub  = window._maraLastSubscribe;
-          const attr = (sub && Date.now() - sub.ts < 8000)
-            ? { handle: sub.handle, nick: sub.nick }
-            : { handle: null, nick: null };
-
-          capture(evt.track, stream, attr);
+          capture(evt.track, stream, pcOwner || { handle: null, nick: null });
         });
       };
 
-      // Hook RTCPeerConnection — catches every PC from the very first one
+      // Hook RTCPeerConnection — catches every PC from the very first one.
+      // At creation time, pop the oldest pending subscribe from the FIFO queue
+      // (must be < 3s old) and bind it to this PC as its permanent owner.
       const Orig = window.RTCPeerConnection;
       window.RTCPeerConnection = function (...args) {
         const pc = new Orig(...args);
-        watchPC(pc);
+
+        // consume oldest queued subscribe that is still fresh
+        let pcOwner = null;
+        const now = Date.now();
+        while (window._maraSubscribeQueue.length) {
+          const entry = window._maraSubscribeQueue.shift();
+          if (now - entry.ts < 3000) { pcOwner = entry; break; }
+          // entry too old — discard and try next
+        }
+
+        watchPC(pc, pcOwner);
         window._maraRTCPeers.push(pc);
         return pc;
       };
@@ -147,7 +156,8 @@ class AudioCapture extends EventEmitter {
 
   async notifySubscribe(handle, nick) {
     await this._page.evaluate((h, n) => {
-      window._maraLastSubscribe = { handle: h, nick: n, ts: Date.now() };
+      window._maraSubscribeQueue = window._maraSubscribeQueue || [];
+      window._maraSubscribeQueue.push({ handle: h, nick: n, ts: Date.now() });
     }, handle, nick || handle).catch(() => {});
   }
 
