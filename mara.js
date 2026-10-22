@@ -7,10 +7,12 @@ require('dotenv').config();
 const fs   = require('fs');
 const path = require('path');
 
-const RoomMood        = require('./src/RoomMood');
-const RelationshipMap = require('./src/RelationshipMap');
-const UserProfiles    = require('./src/UserProfile');
-const Dashboard       = require('./src/Dashboard');
+const RoomMood              = require('./src/RoomMood');
+const RelationshipMap       = require('./src/RelationshipMap');
+const UserProfiles          = require('./src/UserProfile');
+const Dashboard             = require('./src/Dashboard');
+const SocialIntelligence    = require('./src/SocialIntelligence');
+const MaraAssociativeMemory = require('./MaraAssociativeMemory');
 
 const PLATFORM   = (process.env.PLATFORM || 'chatcommon').toLowerCase();
 const DATA_DIR   = process.env.MARA_DATA_DIR  || path.join(__dirname, 'data');
@@ -31,7 +33,9 @@ if (OWNER === 'freddysparks') {
 const mood     = new RoomMood();
 const relmap   = new RelationshipMap();
 const profiles = new UserProfiles();
-const dash     = new Dashboard(mood, profiles, relmap, { refreshMs: REFRESH_MS });
+const social   = new SocialIntelligence();
+const memory   = new MaraAssociativeMemory(console);
+const dash     = new Dashboard(mood, profiles, relmap, social, memory, { refreshMs: REFRESH_MS });
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
 
@@ -63,12 +67,20 @@ function makeMumbleAdapter() {
   return new MumbleAdapter(server, key, rooms);
 }
 
-function makeStumbleAdapter() {
+async function makeStumbleAdapter() {
   const StumbleChatAdapter = require('./src/StumbleChatAdapter');
-  const cdpPort = process.env.CHROME_CDP_PORT || '9222';
-  const rooms   = (process.env.STUMBLECHAT_ROOMS || '')
+  const AudioPipeline      = require('./src/AudioPipeline');
+
+  const rooms    = (process.env.STUMBLECHAT_ROOMS || '')
     .split(',').map(r => r.trim().toLowerCase()).filter(Boolean);
-  return new StumbleChatAdapter(cdpPort, rooms);
+  const username = process.env.OWNER_ACCOUNT || process.env.STUMBLECHAT_USERNAME || '';
+  const password = process.env.OWNER_PASS    || process.env.STUMBLECHAT_PASSWORD || '';
+
+  // audio pipeline — init loads whisper (or skips gracefully if not installed)
+  const audio = new AudioPipeline(DATA_DIR);
+  await audio.init();
+
+  return new StumbleChatAdapter(rooms, username, password, audio.ready ? audio : null);
 }
 
 // ── Wire adapter events → analyzers ──────────────────────────────────────────
@@ -84,6 +96,8 @@ function wireAdapter(adapter) {
   adapter.on('message', ({ room, nick, text }) => {
     mood.observe(room, nick, text);
     profiles.observe(room, nick, text);
+    social.observe(room, nick, text);
+    memory.store(nick.toLowerCase(), nick, text, room, _msgImportance(text));
 
     if (!recentSpeakers.has(room)) recentSpeakers.set(room, []);
     const recent = recentSpeakers.get(room);
@@ -103,6 +117,31 @@ function wireAdapter(adapter) {
     profiles.onLeave(room, nick);
   });
 
+  adapter.on('nickChange', ({ room, oldNick, newNick }) => {
+    profiles.onNickChange(room, oldNick, newNick);
+  });
+
+  // unknown stumble frame types — log once per type for protocol change detection
+  const _seenFrameTypes = new Set();
+  adapter.on('unknownFrame', ({ room, type, frame }) => {
+    if (_seenFrameTypes.has(type)) return;
+    _seenFrameTypes.add(type);
+    const entry = { ts: new Date().toISOString(), room, type, frame };
+    const file  = path.join(DATA_DIR, 'unknown_frames.jsonl');
+    fs.appendFileSync(file, JSON.stringify(entry) + '\n');
+    console.log(`[proto] new frame type discovered: "${type}" — logged to unknown_frames.jsonl`);
+  });
+
+  // spoken audio — same analysis pipeline as text, shown with 🎤 in feed
+  adapter.on('transcript', ({ room, nick, text }) => {
+    mood.observe(room, nick, text);
+    profiles.observe(room, nick, text);
+    social.observe(room, nick, text);
+    memory.store(nick.toLowerCase(), nick, text, room, _msgImportance(text));
+    relmap.observe(room, nick, text, []);
+    dash.pushFeed(room, `🎤 ${nick}`, text);
+  });
+
   adapter.on('userlist', ({ room, users }) => {
     dash.addRoom(room);
     for (const u of (users || [])) profiles.onJoin(room, u.nick);
@@ -110,6 +149,15 @@ function wireAdapter(adapter) {
 
   adapter.on('connected',    ({ room }) => room && dash.addRoom(room));
   adapter.on('disconnected', ({ room }) => {});
+}
+
+// ── Importance heuristic for memory storage ───────────────────────────────────
+
+function _msgImportance(text) {
+  const words = text.split(/\s+/).filter(Boolean).length;
+  const excl  = (text.match(/[!?]/g) || []).length;
+  const caps  = (text.match(/[A-Z]/g) || []).length;
+  return Math.min(0.9, 0.2 + Math.min(words / 50, 0.4) + excl * 0.05 + (caps > 5 ? 0.15 : 0));
 }
 
 // ── Snapshot ──────────────────────────────────────────────────────────────────
@@ -123,6 +171,7 @@ function saveSnapshot() {
       mood:          mood.snapshot(),
       relationships: relmap.snapshot(),
       profiles:      profiles.snapshot(),
+      social:        social.snapshot(),
     };
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
     console.log(`[mara] snapshot saved → ${file}`);
@@ -153,7 +202,7 @@ async function main() {
   }
 
   if (PLATFORM === 'stumblechat' || PLATFORM === 'stumble') {
-    const sc = makeStumbleAdapter();
+    const sc = await makeStumbleAdapter();
     wireAdapter(sc);
     adapters.push(sc);
     await sc.connect();
@@ -169,6 +218,7 @@ async function main() {
   async function shutdown(sig) {
     console.log(`\n[mara] ${sig} — saving snapshot and shutting down`);
     saveSnapshot();
+    memory.destroy();
     dash.stop();
     for (const a of adapters) {
       try { await a.disconnect(); } catch (_) {}

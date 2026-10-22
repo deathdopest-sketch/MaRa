@@ -67,7 +67,10 @@ class WsListener {
     try {
       if (this._cdpSession) await this.stop();
 
-      const cdp = await this.page.target().createCDPSession();
+      // puppeteer v21+ exposes createCDPSession() directly on Page
+      const cdp = typeof this.page.createCDPSession === 'function'
+        ? await this.page.createCDPSession()
+        : await this.page.target().createCDPSession();
       this._cdpSession = cdp;
 
       await cdp.send('Network.enable');
@@ -96,6 +99,10 @@ class WsListener {
   }
 
   get isActive() { return this._active; }
+
+  getNick(handle) {
+    return this._nickMap.get(String(handle)) || null;
+  }
 
   /** Returns the last n frames from the buffer (default 20) — pre-moderation context */
   getFrameContext(n = 20) {

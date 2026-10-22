@@ -153,6 +153,19 @@ class MaraAssociativeMemory {
   }
 
   /**
+   * Get the most recent/important stored moments for a specific user handle.
+   */
+  getUserEpisodes(handle, limit = 5) {
+    const h = String(handle);
+    const matching = this._episodes
+      .filter(ep => ep.handle === h)
+      .map(ep => ({ ep, score: decayScore(ep.importance, Date.now() - ep.ts) }))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, limit);
+    return matching.map(({ ep }) => ({ nick: ep.nick, text: ep.text, room: ep.room, ts: ep.ts }));
+  }
+
+  /**
    * Find users who share a concept with the given handle —
    * useful for "X and Y both talk about dark aesthetics" type reads.
    */
