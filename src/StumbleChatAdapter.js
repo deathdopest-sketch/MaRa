@@ -138,6 +138,11 @@ class StumbleChatAdapter extends EventEmitter {
   }
 
   async _openRoom(page, roomName) {
+    // Confirmed-active broadcasters — populated by 'producers' WS snapshot (ground truth)
+    // and kept live by camOn/camOff. Used at chunk-time to reject false attributions.
+    const activeProducers    = new Set();
+    let   producersReceived  = false;
+
     const listener = new WsListener(roomName, page, '__mara_observer__', {
       onMessage   : (room, nick, text, handle) => this.emit('message',    { room, nick, text, handle }),
       onJoin      : (room, nick, handle, username, mod) => this.emit('join', { room, nick, handle, username, mod: mod || 0 }),
@@ -148,13 +153,38 @@ class StumbleChatAdapter extends EventEmitter {
       onSysMsg    : (room, text) => process.env.DEBUG_MARA && console.log(`[SysMsg:${room}] ${text}`),
       onBan          : (room, nick) => console.log(`[StumbleChat:${room}] BAN: ${nick}`),
       onKick         : (room, nick) => console.log(`[StumbleChat:${room}] KICK: ${nick}`),
-      // unknown frame types → emit for protocol change detection / logging
       onNewFrameType : (room, type, frame) => this.emit('unknownFrame', { room, type, frame }),
-      // when someone turns on their mic, inject their identity into the page
-      // so the next WebRTC track event can be attributed to them
-      onCamOn     : (room, handle) => {
+
+      // producers = server's ground truth snapshot of who is actually broadcasting
+      // fires on join and whenever the SFU state changes
+      onProducers : (room, producers) => {
+        producersReceived = true;
+        activeProducers.clear();
+        for (const p of (producers || [])) {
+          // producers may be objects {handle, ...} or bare handle numbers
+          const h = (typeof p === 'object' ? String(p.handle ?? p.id ?? '') : String(p)).trim();
+          if (h && h !== 'undefined' && h !== 'null') activeProducers.add(h);
+        }
+        // Re-queue all confirmed producers — their tracks are about to arrive (or already in flight)
+        for (const h of activeProducers) {
+          const nick = listener.getNick(h) || h;
+          capture?.notifySubscribe(h, nick);
+        }
+        if (process.env.DEBUG_MARA) {
+          console.log(`[Audio:${room}] producers confirmed: [${[...activeProducers].join(', ')}]`);
+        }
+      },
+
+      // camOn: someone started broadcasting — add to confirmed set and queue attribution
+      onCamOn : (room, handle) => {
+        activeProducers.add(handle);
         const nick = listener.getNick(handle) || handle;
         capture?.notifySubscribe(handle, nick);
+      },
+
+      // camOff: someone stopped broadcasting — remove from confirmed set
+      onCamOff : (room, handle) => {
+        activeProducers.delete(handle);
       },
     }, null);
 
@@ -175,9 +205,20 @@ class StumbleChatAdapter extends EventEmitter {
     if (capture) {
       await capture.start();
       capture.on('chunk', ({ room, trackId, b64, sampleRate, handle, nick }) => {
-        // if nick is still unknown at chunk time, try the nickMap one more time
-        const resolvedNick = nick || listener.getNick(handle) || null;
-        this._audio.receiveChunk(room, trackId, b64, sampleRate, handle, resolvedNick);
+        const resolvedHandle = handle ? String(handle) : null;
+        const resolvedNick   = nick || listener.getNick(resolvedHandle) || null;
+
+        // After the first producers snapshot arrives, only attribute audio to
+        // handles the server has confirmed as active broadcasters.
+        // Before that snapshot, pass through (no producers info yet).
+        const knownBroadcaster = !producersReceived
+          || (resolvedHandle && activeProducers.has(resolvedHandle));
+
+        this._audio.receiveChunk(
+          room, trackId, b64, sampleRate,
+          knownBroadcaster ? resolvedHandle : null,
+          knownBroadcaster ? resolvedNick   : null,
+        );
       });
     }
 
