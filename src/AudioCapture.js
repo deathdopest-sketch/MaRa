@@ -46,7 +46,9 @@ class AudioCapture extends EventEmitter {
           ctx.resume().catch(() => {});  // force-resume — Chrome suspends without user gesture
 
           const src  = ctx.createMediaStreamSource(stream);
-          const proc = ctx.createScriptProcessor(8192, 1, 1);
+          // 2 input channels so Chrome properly downmixes stereo WebRTC streams;
+          // 1 output channel — we only need mono for Whisper
+          const proc = ctx.createScriptProcessor(8192, 2, 1);
 
           // store strong refs so V8 GC doesn't collect the audio graph
           window._maraAudioNodes.push({ ctx, src, proc, trackId: track.id });
@@ -58,15 +60,22 @@ class AudioCapture extends EventEmitter {
           const target = SR * CHUNK_S;
 
           proc.onaudioprocess = (e) => {
-            const raw = e.inputBuffer.getChannelData(0);
-            // Float32Array.set() is faster than a push loop for bulk copy
+            const ch0 = e.inputBuffer.getChannelData(0);
+            const ch1 = e.inputBuffer.numberOfChannels > 1
+              ? e.inputBuffer.getChannelData(1)
+              : null;
+
             const needed = target - buf.length;
-            const take   = Math.min(raw.length, needed);
-            for (let i = 0; i < take; i++) buf.push(raw[i]);
-            if (take < raw.length) {
-              // chunk boundary — send current, start fresh with leftover
+            const take   = Math.min(ch0.length, needed);
+            for (let i = 0; i < take; i++) {
+              // downmix stereo → mono by averaging both channels
+              buf.push(ch1 ? (ch0[i] + ch1[i]) * 0.5 : ch0[i]);
+            }
+            if (take < ch0.length) {
               flushBuf();
-              for (let i = take; i < raw.length; i++) buf.push(raw[i]);
+              for (let i = take; i < ch0.length; i++) {
+                buf.push(ch1 ? (ch0[i] + ch1[i]) * 0.5 : ch0[i]);
+              }
             } else if (buf.length >= target) {
               flushBuf();
             }
@@ -114,35 +123,34 @@ class AudioCapture extends EventEmitter {
         }
       };
 
-      const watchPC = (pc, pcOwner) => {
-        // pcOwner is bound at PC-creation time, not at track-arrival time.
-        // This prevents a stale subscribe event from a different user
-        // (e.g. the room owner who has a permanent stream) bleeding onto
-        // someone else's audio track that arrives seconds later.
-        pc.addEventListener('track', (evt) => {
-          if (evt.track.kind !== 'audio') return;
-          const stream = evt.streams[0] || new MediaStream([evt.track]);
-          capture(evt.track, stream, pcOwner || { handle: null, nick: null });
-        });
-      };
-
-      // Hook RTCPeerConnection — catches every PC from the very first one.
-      // At creation time, pop the oldest pending subscribe from the FIFO queue
-      // (must be < 3s old) and bind it to this PC as its permanent owner.
-      const Orig = window.RTCPeerConnection;
-      window.RTCPeerConnection = function (...args) {
-        const pc = new Orig(...args);
-
-        // consume oldest queued subscribe that is still fresh
-        let pcOwner = null;
+      // Pop the freshest matching attribution from the queue at track-arrival time.
+      // StumbleChat uses an SFU — one PC, many tracks via renegotiation — so
+      // attributing at PC-creation time only ever catches the first broadcaster.
+      // In SFU mode: subscribe fires → renegotiation → track arrives, in order.
+      // FIFO pop at track time correctly pairs each subscribe with its track.
+      const popFreshAttribution = () => {
         const now = Date.now();
         while (window._maraSubscribeQueue.length) {
           const entry = window._maraSubscribeQueue.shift();
-          if (now - entry.ts < 3000) { pcOwner = entry; break; }
-          // entry too old — discard and try next
+          if (now - entry.ts < 2000) return entry;
+          // stale — discard and keep looking
         }
+        return null;
+      };
 
-        watchPC(pc, pcOwner);
+      const watchPC = (pc) => {
+        pc.addEventListener('track', (evt) => {
+          if (evt.track.kind !== 'audio') return;
+          const stream = evt.streams[0] || new MediaStream([evt.track]);
+          const attr   = popFreshAttribution() || { handle: null, nick: null };
+          capture(evt.track, stream, attr);
+        });
+      };
+
+      const Orig = window.RTCPeerConnection;
+      window.RTCPeerConnection = function (...args) {
+        const pc = new Orig(...args);
+        watchPC(pc);
         window._maraRTCPeers.push(pc);
         return pc;
       };
