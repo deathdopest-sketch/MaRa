@@ -13,6 +13,7 @@ const UserProfiles          = require('./src/UserProfile');
 const Dashboard             = require('./src/Dashboard');
 const SocialIntelligence    = require('./src/SocialIntelligence');
 const MaraAssociativeMemory = require('./MaraAssociativeMemory');
+const ArcTracker            = require('./src/ArcTracker');
 
 const PLATFORM   = (process.env.PLATFORM || 'chatcommon').toLowerCase();
 const DATA_DIR   = process.env.MARA_DATA_DIR  || path.join(__dirname, 'data');
@@ -35,7 +36,8 @@ const relmap   = new RelationshipMap();
 const profiles = new UserProfiles();
 const social   = new SocialIntelligence();
 const memory   = new MaraAssociativeMemory(console);
-const dash     = new Dashboard(mood, profiles, relmap, social, memory, { refreshMs: REFRESH_MS });
+const arc      = new ArcTracker(profiles, social, relmap);
+const dash     = new Dashboard(mood, profiles, relmap, social, memory, arc, { refreshMs: REFRESH_MS });
 
 // ── Adapter factory ───────────────────────────────────────────────────────────
 
@@ -90,6 +92,8 @@ function wireAdapter(adapter) {
     dash.addRoom(room);
   }
 
+  arc.on('alert', ({ room, level, text }) => dash.pushAlert({ room, level, text }));
+
   // recent speakers per room for relationship proximity detection
   const recentSpeakers = new Map();
 
@@ -105,6 +109,7 @@ function wireAdapter(adapter) {
     if (recent.length > 5) recent.shift();
 
     relmap.observe(room, nick, text, [...recent]);
+    arc.observe(room, nick, text, [...recent]);
     dash.pushFeed(room, nick, text);
   });
 
@@ -139,6 +144,7 @@ function wireAdapter(adapter) {
     social.observe(room, nick, text);
     memory.store(nick.toLowerCase(), nick, text, room, _msgImportance(text));
     relmap.observe(room, nick, text, []);
+    arc.observe(room, nick, text, []);
     dash.pushFeed(room, `🎤 ${nick}`, text);
   });
 
@@ -172,6 +178,7 @@ function saveSnapshot() {
       relationships: relmap.snapshot(),
       profiles:      profiles.snapshot(),
       social:        social.snapshot(),
+      arcs:          arc.snapshot(),
     };
     fs.writeFileSync(file, JSON.stringify(data, null, 2));
     console.log(`[mara] snapshot saved → ${file}`);

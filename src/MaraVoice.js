@@ -46,7 +46,7 @@ async function _askOllama(prompt) {
 
 // ── Deterministic fallback — always works ─────────────────────────────────────
 
-function _deterministic(p, socialNarrative) {
+function _deterministic(p, socialNarrative, roomContext) {
   const m     = p.moralityScore      || 5;
   const c     = p.cunningScore       || 3;
   const f     = p.formidabilityScore || 3;
@@ -87,6 +87,15 @@ function _deterministic(p, socialNarrative) {
   if (socialNarrative) {
     const first = socialNarrative.split(/[.!]/).find(s => s.trim().length > 10);
     if (first) lines.push(first.trim() + '.');
+  }
+
+  // ── arc context: room dynamic ──
+  if (roomContext) {
+    const arcMatch = roomContext.match(/arc:\s*(.+)/i);
+    if (arcMatch && lines.length < 2) {
+      const arcSummary = arcMatch[1].trim();
+      lines.push(`Room dynamic: ${arcSummary[0].toLowerCase()}${arcSummary.slice(1)}.`);
+    }
   }
 
   // ── closing: predictive note ──
@@ -135,7 +144,7 @@ async function think(p, socialNarrative, roomContext) {
 
   const prompt = _buildPrompt(p, socialNarrative, roomContext);
   const llm    = await _askOllama(prompt);
-  return llm || _deterministic(p, socialNarrative);
+  return llm || _deterministic(p, socialNarrative, roomContext);
 }
 
 module.exports = { think, DWELL_MS };

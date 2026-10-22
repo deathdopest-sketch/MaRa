@@ -79,6 +79,9 @@ class UserProfiles {
 
         // story tracking for inconsistency detection
         storyStatements:    [],  // { ts, claim }
+
+        // temporal patterns — message count per hour of day (0–23)
+        hourCounts:         new Array(24).fill(0),
       });
     }
     return map.get(key);
@@ -101,6 +104,7 @@ class UserProfiles {
 
     p.recentTs.push(now);
     if (p.recentTs.length > 10) p.recentTs.shift();
+    p.hourCounts[new Date(now).getHours()]++;
 
     // ── message batching ─────────────────────────────────────────
     // 3+ short messages within 8 seconds = batching behaviour
@@ -379,6 +383,7 @@ class UserProfiles {
           nickHistory: p.nickHistory || [],
           flags:       p.flags       || [],
           storyStatements: p.storyStatements || [],
+          hourCounts:      p.hourCounts     || new Array(24).fill(0),
           sessionMessages: 0,  // reset on reload — session is current run only
         });
       }

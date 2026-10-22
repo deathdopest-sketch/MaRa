@@ -2,6 +2,9 @@
 
 // she knows exactly who's who. and she never forgets.
 
+const fs   = require('fs');
+const path = require('path');
+
 const { think, DWELL_MS } = require('./MaraVoice');
 
 const C = {
@@ -14,10 +17,10 @@ const C = {
   cyn  : '\x1b[36m',
   mag  : '\x1b[35m',
   wht  : '\x1b[37m',
-  home : '\x1b[H',        // cursor home — no clear, just overwrite
-  hide : '\x1b[?25l',     // hide cursor during draw
-  show : '\x1b[?25h',     // restore cursor
-  erase: '\x1b[J',        // erase from cursor to end of screen
+  home : '\x1b[H',
+  hide : '\x1b[?25l',
+  show : '\x1b[?25h',
+  erase: '\x1b[J',
 };
 
 const LEFT_W = 24;
@@ -34,7 +37,6 @@ function barColor(s) {
   return C.grn;
 }
 
-// pad a string (may contain ANSI codes) to n visible characters
 function padVis(str, n) {
   const plain = str.replace(/\x1b\[[0-9;]*m/g, '');
   if (plain.length >= n) {
@@ -87,24 +89,26 @@ function relToneColor(tone) {
 }
 
 class Dashboard {
-  constructor(mood, profiles, relmap, social, memory, opts = {}) {
+  constructor(mood, profiles, relmap, social, memory, arc, opts = {}) {
     this._mood      = mood;
     this._prof      = profiles;
     this._relmap    = relmap;
     this._social    = social  || null;
     this._memory    = memory  || null;
+    this._arc       = arc     || null;
     this._rooms     = [];
     this._roomIdx   = 0;
     this._userIdx   = 0;
     this._feed      = new Map();
     this._interval  = null;
     this._refreshMs = opts.refreshMs || 2000;
+    this._dataDir   = process.env.MARA_DATA_DIR || path.join(process.cwd(), 'data');
 
     // commentary
-    this._chat        = [];      // [{ ts, nick, text }] — mara's thoughts
+    this._chat        = [];
     this._dwellStart  = Date.now();
-    this._commented   = false;   // true once she's spoken about current user
-    this._thinking    = false;   // prevent concurrent LLM calls
+    this._commented   = false;
+    this._thinking    = false;
   }
 
   addRoom(room) {
@@ -119,8 +123,15 @@ class Dashboard {
     if (feed.length > 30) feed.shift();
   }
 
+  pushAlert({ room, level, text }) {
+    if (!room) return;
+    if (!this._feed.has(room)) this._feed.set(room, []);
+    const feed = this._feed.get(room);
+    feed.push({ ts: Date.now(), nick: '⚡', text, isAlert: true, level: level || 'info' });
+    if (feed.length > 30) feed.shift();
+  }
+
   start() {
-    // clear once, then all redraws overwrite in place — no scroll
     process.stdout.write('\x1b[2J');
 
     if (process.stdin.isTTY) {
@@ -142,6 +153,12 @@ class Dashboard {
           this._userIdx = 0;
           this._resetDwell();
           this._draw();
+        }
+        if (key === 'e') {
+          const room = this._room();
+          const allP = room ? this._prof.getAllProfiles(room) : [];
+          const sel  = allP[this._userIdx] || null;
+          if (sel) this._exportDossier(sel, room);
         }
       });
     }
@@ -178,9 +195,11 @@ class Dashboard {
   _triggerCommentary(p, room) {
     if (this._thinking) return;
     this._thinking = true;
-    const social = this._social?.narrative(room, p.nick) || null;
-    const mood   = this._mood.getTone(room);
-    think(p, social, `${room} — room tone: ${mood}`)
+    const social   = this._social?.narrative(room, p.nick) || null;
+    const arcNarr  = this._arc?.getNarrative(room) || null;
+    const mood     = this._mood.getTone(room);
+    const roomCtx  = `${room} — room tone: ${mood}${arcNarr ? ` — arc: ${arcNarr}` : ''}`;
+    think(p, social, roomCtx)
       .then(text => {
         if (text) {
           this._chat.push({ ts: Date.now(), nick: p.nick, text });
@@ -202,13 +221,13 @@ class Dashboard {
     const RW   = W - LEFT_W - 1;
 
     // Fixed-height sections:
-    //   3 header lines + 1 divider = 4
+    //   3 header lines (top border, main header, arc narrative) + 1 divider = 4
     //   1 feed divider + FEED_H feed rows = FEED_H + 1
     //   1 mara divider + MARA_H mara rows + 1 box bottom + 1 hint = MARA_H + 3
-    const FEED_H   = 4;
-    const MARA_H   = 3;
-    const FIXED    = 4 + FEED_H + 1 + MARA_H + 3;
-    const PANEL_H  = Math.max(6, rows - FIXED);
+    const FEED_H  = 4;
+    const MARA_H  = 3;
+    const FIXED   = 5 + FEED_H + 1 + MARA_H + 3;
+    const PANEL_H = Math.max(6, rows - FIXED);
 
     const room = this._room();
 
@@ -218,10 +237,11 @@ class Dashboard {
       return;
     }
 
-    const energy  = this._mood.getEnergy(room);
-    const tone    = this._mood.getTone(room);
-    const allProf = this._prof.getAllProfiles(room);
-    const feed    = (this._feed.get(room) || []).slice(-FEED_H);
+    const energy     = this._mood.getEnergy(room);
+    const tone       = this._mood.getTone(room);
+    const allProf    = this._prof.getAllProfiles(room);
+    const feed       = (this._feed.get(room) || []).slice(-FEED_H);
+    const arcNarr    = this._arc ? this._arc.getNarrative(room) : null;
 
     if (this._userIdx > Math.max(0, allProf.length - 1)) this._userIdx = Math.max(0, allProf.length - 1);
     const sel = allProf[this._userIdx] || null;
@@ -233,11 +253,15 @@ class Dashboard {
       ? `${room} [${this._roomIdx + 1}/${this._rooms.length}]`
       : room;
     const hdr = `  ☠  MaRa  ·  ${C.cyn}${roomLabel}${C.r}  ·  ${energyColor(energy)}  ·  ${toneColor(tone)}  ·  ${C.dim}${allProf.length} users${C.r}`;
+    const arcLine = arcNarr
+      ? `  ${C.ylw}◈${C.r}  ${C.dim}${arcNarr}${C.r}`
+      : '';
     out.push(`${C.dim}╔${'═'.repeat(W)}╗${C.r}`);
     out.push(`${C.dim}║${C.r}${padVis(hdr, W)}${C.dim}║${C.r}`);
+    out.push(`${C.dim}║${C.r}${padVis(arcLine, W)}${C.dim}║${C.r}`);
     out.push(`${C.dim}╠${'═'.repeat(LEFT_W + 1)}╤${'═'.repeat(RW)}╣${C.r}`);
 
-    // ── split panel — capped to PANEL_H rows ─────────────────────────────────
+    // ── split panel ───────────────────────────────────────────────────────────
     const left  = this._userListLines(allProf, PANEL_H);
     const right = this._profileLines(sel, room, RW, PANEL_H);
 
@@ -255,13 +279,19 @@ class Dashboard {
         out.push(`${C.dim}║${C.r}${' '.repeat(W)}${C.dim}║${C.r}`);
       }
     } else {
-      const paddedFeed = feed.slice(-(FEED_H));
-      // pad to FEED_H lines
+      const paddedFeed = feed.slice(-FEED_H);
       while (paddedFeed.length < FEED_H) paddedFeed.unshift(null);
       for (const f of paddedFeed) {
         if (!f) { out.push(`${C.dim}║${C.r}${' '.repeat(W)}${C.dim}║${C.r}`); continue; }
-        const ts  = new Date(f.ts).toLocaleTimeString('en-AU', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-        const row = `  ${C.dim}${ts}${C.r}  ${C.cyn}${f.nick.slice(0, 14).padEnd(14)}${C.r}  ${f.text}`;
+        let row;
+        if (f.isAlert) {
+          const ac = f.level === 'warn' ? C.red : C.ylw;
+          const ts = new Date(f.ts).toLocaleTimeString('en-AU', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          row = `  ${C.dim}${ts}${C.r}  ${ac}⚡  ${f.text}${C.r}`;
+        } else {
+          const ts = new Date(f.ts).toLocaleTimeString('en-AU', { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
+          row = `  ${C.dim}${ts}${C.r}  ${C.cyn}${f.nick.slice(0, 14).padEnd(14)}${C.r}  ${f.text}`;
+        }
         out.push(`${C.dim}║${C.r}${padVis(row, W)}${C.dim}║${C.r}`);
       }
     }
@@ -273,9 +303,7 @@ class Dashboard {
 
     for (const c of recentChat) {
       if (!c) {
-        // empty slot — show hint on first empty if nothing has been said yet
-        const isEmpty = this._chat.length === 0;
-        const hintTxt = isEmpty
+        const hintTxt = this._chat.length === 0
           ? `  ${C.dim}☠  pause on a user for ${Math.round(DWELL_MS / 1000)}s — mara will tell you what she thinks${C.r}`
           : '';
         out.push(`${C.dim}║${C.r}${padVis(hintTxt, W)}${C.dim}║${C.r}`);
@@ -287,9 +315,8 @@ class Dashboard {
     }
 
     out.push(`${C.dim}╚${'═'.repeat(W)}╝${C.r}`);
-    out.push(`${C.dim}  [↑↓] select   [←→ tab] room   [q] quit${C.r}`);
+    out.push(`${C.dim}  [↑↓] select   [←→ tab] room   [e] export dossier   [q] quit${C.r}`);
 
-    // erase anything below, restore cursor
     out.push(C.erase + C.show);
 
     process.stdout.write(out.join('\r\n'));
@@ -303,7 +330,6 @@ class Dashboard {
       lines.push(`${C.dim}  empty room${C.r}`);
       return lines;
     }
-    // keep selected user visible — scroll window
     const start = Math.max(0, this._userIdx - Math.max(0, maxH - 4));
     for (let i = start; i < allProf.length && lines.length < maxH - 1; i++) {
       const p   = allProf[i];
@@ -357,7 +383,7 @@ class Dashboard {
     const tNeu = p.neutralCount  || 0;
     const tTot = tPos + tNeg + tNeu;
     if (tTot > 0) {
-      const pct = (n) => Math.round((n / tTot) * 100);
+      const pct   = (n) => Math.round((n / tTot) * 100);
       const label = tNeg > tPos * 1.5 ? `${C.red}[HOSTILE]${C.r}`
         : tPos > tNeg * 1.5           ? `${C.grn}[FRIENDLY]${C.r}`
         : `${C.dim}[MIXED]${C.r}`;
@@ -387,18 +413,44 @@ class Dashboard {
       }
     }
 
+    // ── active arcs ───────────────────────────────────────────
+    if (this._arc) {
+      const arcs = this._arc.getArcsFor(room, p.nick);
+      if (arcs.length) {
+        lines.push(`${C.ylw} ARCS${C.r}`);
+        for (const a of arcs) {
+          const ac = a.confidence >= 7 ? C.red : C.ylw;
+          lines.push(` ${ac}◈${C.r} ${C.dim}${a.summary}${C.r}`);
+        }
+        lines.push('');
+      }
+    }
+
     // ── memory: notable past moments ──────────────────────────
     if (this._memory) {
       const episodes = this._memory.getUserEpisodes(p.nick.toLowerCase(), 3);
       if (episodes.length) {
         lines.push(`${C.cyn} MEMORY${C.r}`);
         for (const ep of episodes) {
-          const ago  = relAge(ep.ts);
-          const txt  = ep.text.slice(0, w - 10);
+          const ago = relAge(ep.ts);
+          const txt = ep.text.slice(0, w - 10);
           lines.push(`${C.dim} ${ago}  ${txt}${C.r}`);
         }
         lines.push('');
       }
+    }
+
+    // ── temporal patterns ─────────────────────────────────────
+    if (p.hourCounts?.some(c => c > 0)) {
+      const peak = p.hourCounts
+        .map((c, h) => ({ h, c }))
+        .sort((a, b) => b.c - a.c)
+        .slice(0, 3)
+        .filter(x => x.c > 0)
+        .map(x => `${String(x.h).padStart(2, '0')}:xx ×${x.c}`)
+        .join('  ');
+      lines.push(`${C.dim} PEAK HOURS  ${peak}${C.r}`);
+      lines.push('');
     }
 
     // ── flags ─────────────────────────────────────────────────
@@ -490,6 +542,120 @@ class Dashboard {
     }
     if (cur) lines.push(cur);
     return lines;
+  }
+
+  // ── dossier export ────────────────────────────────────────────────────────
+
+  _exportDossier(p, room) {
+    try {
+      fs.mkdirSync(this._dataDir, { recursive: true });
+      const ts   = new Date().toISOString().replace(/[:.]/g, '-');
+      const file = path.join(this._dataDir, `dossier_${p.nick}_${ts}.txt`);
+      const hr   = '─'.repeat(60);
+      const lines = [];
+
+      lines.push(`MARA DOSSIER — ${p.nick}`);
+      lines.push(`Room: ${room}  ·  Exported: ${new Date().toLocaleString()}`);
+      lines.push(hr);
+      lines.push('');
+      lines.push(`Messages: ${p.messages}  Session: ${p.sessionMessages || 0}  Style: ${p.style}  Energy: ${p.energy}`);
+      lines.push(`First seen: ${new Date(p.firstSeen).toLocaleString()}  Last active: ${new Date(p.lastSeen).toLocaleString()}`);
+      if (p.nickHistory?.length) {
+        lines.push(`Nick history: ${p.nickHistory.map(n => n.nick).join(' → ')}`);
+      }
+      lines.push('');
+
+      lines.push('TRAITS');
+      lines.push(`  Morality:    ${(p.moralityScore      || 0).toFixed(1)}/10`);
+      lines.push(`  Cunning:     ${(p.cunningScore       || 0).toFixed(1)}/10`);
+      lines.push(`  Formidable:  ${(p.formidabilityScore || 0).toFixed(1)}/10`);
+      lines.push(`  Volatility:  ${(p.volatilityScore    || 0).toFixed(1)}/10`);
+      lines.push('');
+
+      const tPos = p.positiveCount || 0, tNeg = p.negativeCount || 0, tNeu = p.neutralCount || 0;
+      const tTot = tPos + tNeg + tNeu;
+      if (tTot > 0) {
+        const pct = n => Math.round((n / tTot) * 100);
+        lines.push(`TONE  +${pct(tPos)}% positive  ~${pct(tNeu)}% neutral  -${pct(tNeg)}% negative`);
+        lines.push('');
+      }
+
+      if (this._social) {
+        const narrative = this._social.narrative(room, p.nick);
+        if (narrative) {
+          lines.push('SOCIAL READ');
+          lines.push(`  ${narrative}`);
+          lines.push('');
+        }
+      }
+
+      if (this._arc) {
+        const arcs = this._arc.getArcsFor(room, p.nick);
+        if (arcs.length) {
+          lines.push('ACTIVE ARCS');
+          for (const a of arcs) {
+            lines.push(`  [${a.type}] conf: ${a.confidence.toFixed(1)}  ${a.summary}`);
+          }
+          lines.push('');
+        }
+      }
+
+      const flagCounts = {};
+      for (const f of (p.flags || [])) flagCounts[f.type] = (flagCounts[f.type] || 0) + 1;
+      if (Object.keys(flagCounts).length) {
+        lines.push('FLAGS');
+        for (const [type, count] of Object.entries(flagCounts)) {
+          lines.push(`  ⚑ ${type.replace(/_/g, ' ')} ×${count}`);
+        }
+        lines.push('');
+      }
+
+      if (p.hourCounts?.some(c => c > 0)) {
+        const peak = p.hourCounts
+          .map((c, h) => ({ h, c }))
+          .sort((a, b) => b.c - a.c)
+          .slice(0, 5)
+          .filter(x => x.c > 0)
+          .map(x => `${String(x.h).padStart(2, '0')}:00 (${x.c} msgs)`)
+          .join('  ');
+        lines.push(`PEAK HOURS  ${peak}`);
+        lines.push('');
+      }
+
+      const topTopics = [...(p.topics || new Map()).entries()]
+        .sort((a, b) => b[1] - a[1]).slice(0, 10).map(([w]) => w).join(', ');
+      if (topTopics) {
+        lines.push(`TOPICS  ${topTopics}`);
+        lines.push('');
+      }
+
+      if (this._memory) {
+        const episodes = this._memory.getUserEpisodes(p.nick.toLowerCase(), 10);
+        if (episodes.length) {
+          lines.push('MEMORY EPISODES');
+          for (const ep of episodes) {
+            lines.push(`  ${new Date(ep.ts).toLocaleString()}  ${ep.text.slice(0, 120)}`);
+          }
+          lines.push('');
+        }
+      }
+
+      const rels = this._relmap.getRelationships(room)
+        .filter(e => e.a === p.nick.toLowerCase() || e.b === p.nick.toLowerCase());
+      if (rels.length) {
+        lines.push('RELATIONSHIPS');
+        for (const e of rels) {
+          const other = e.a === p.nick.toLowerCase() ? e.b : e.a;
+          lines.push(`  ${e.tone === 'hostile' ? '✗' : '↔'} ${other}  [${e.tone} · ${e.exchangeCount} exchanges]`);
+        }
+        lines.push('');
+      }
+
+      fs.writeFileSync(file, lines.join('\n'));
+      this.pushFeed(room, '☠', `dossier → ${path.basename(file)}`);
+    } catch (e) {
+      this.pushFeed(room, '☠', `export failed: ${e.message}`);
+    }
   }
 }
 
