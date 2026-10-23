@@ -11,6 +11,68 @@ const fs   = require('fs');
 // browser-side already normalizes and gates at 0.0003 peak; this is a final safety net
 const SILENCE_THRESHOLD = 0.00005;
 
+// ── Speech vs. music/media detector ──────────────────────────────────────────
+// Returns false when the audio looks like sustained media (music, movies, BGM)
+// rather than speech. Uses two cheap features:
+//
+//   1. Energy CV (coefficient of variation over 40ms frames):
+//      Speech is choppy — words and pauses create high energy variance (CV ≥ 0.30).
+//      Music/movies are mixed and mastered to be continuous — low CV + very few
+//      silent frames is the primary signature.
+//
+//   2. Zero-crossing rate:
+//      Catches pure static/noise: extremely high ZCR with steady energy.
+//
+// Deliberately conservative — only blocks the clearest cases. Better to let a
+// borderline chunk through to Whisper (which will output garbage we can filter
+// post-transcription) than to drop real speech.
+function _likelySpeech(f32, sampleRate) {
+  const frameSize = Math.round(sampleRate * 0.04);  // 40ms analysis windows
+  const frames    = Math.floor(f32.length / frameSize);
+  if (frames < 6) return true;
+
+  const energies = new Float32Array(frames);
+  for (let i = 0; i < frames; i++) {
+    let sum = 0;
+    const off = i * frameSize;
+    for (let j = 0; j < frameSize; j++) sum += f32[off + j] ** 2;
+    energies[i] = Math.sqrt(sum / frameSize);
+  }
+
+  const maxE   = Math.max(...energies);
+  const floor  = maxE * 0.10;
+  const active = [];
+  let   silent = 0;
+  for (let i = 0; i < frames; i++) {
+    if (energies[i] > floor) active.push(energies[i]);
+    else silent++;
+  }
+  if (active.length < 4) return true;  // mostly silence — energy gate handles it
+
+  const activeFrac = active.length / frames;
+  const mean = active.reduce((s, v) => s + v, 0) / active.length;
+  const std  = Math.sqrt(active.reduce((s, v) => s + (v - mean) ** 2, 0) / active.length);
+  const cv   = mean > 0 ? std / mean : 0;
+
+  // Music/movie: very steady energy + almost no silent frames
+  if (cv < 0.25 && activeFrac > 0.82) return false;
+  if (cv < 0.35 && activeFrac > 0.90) return false;
+
+  // Static/noise: extremely high zero-crossing rate + steady energy
+  let zc = 0;
+  for (let i = 1; i < f32.length; i++) {
+    if ((f32[i] >= 0) !== (f32[i - 1] >= 0)) zc++;
+  }
+  const zcrPerSec = zc / (f32.length / sampleRate);
+  if (zcrPerSec > 6000 && cv < 0.5) return false;
+
+  return true;
+}
+
+// Whisper often outputs these when transcribing music, noise, or silence.
+// Check after stripping bracket markers.
+const HALLUC_RX = /^(thank(?:s| you)[\s!.]*|thanks for watching[\s!.]*|(?:please )?subscribe[\s!.]*|like and subscribe[\s!.]*|you[\s!.]*|okay[\s.]*|ok[\s.]*|bye[\s!.]*|goodbye[\s!.]*|[hH]+[mM]+[\s.]*|[uU]+[hH]?[\s.]*|yeah[\s.]*|yes[\s.]*|no[\s.]*|[.,!?\s]+)$/i;
+
 class AudioPipeline extends EventEmitter {
   constructor(dataDir) {
     super();
@@ -80,6 +142,12 @@ class AudioPipeline extends EventEmitter {
     for (let i = 0; i < f32.length; i++) energy += f32[i] * f32[i];
     if (energy / f32.length < SILENCE_THRESHOLD) return;
 
+    // Speech detector — skip music, movies, and static before Whisper sees them
+    if (!_likelySpeech(f32, sampleRate)) {
+      if (process.env.DEBUG_AUDIO) console.log(`[Audio] dropped non-speech chunk (${nick || handle || '?'})`);
+      return;
+    }
+
     // Serialize — whisper is synchronous and we don't want pile-ups
     this._queue = this._queue.then(async () => {
       try {
@@ -90,11 +158,17 @@ class AudioPipeline extends EventEmitter {
           task: 'transcribe',
         });
 
-        const text = (result.text || '')
-          .trim()
-          .replace(/^\[(BLANK_AUDIO|Music|Applause|Laughter|Silence)\]$/i, '')
-          .replace(/^(Thanks for watching!?|Thank you\.?|Subscribe\.?)$/i, '')
+        // Strip Whisper's non-speech markers and musical notation
+        let text = (result.text || '').trim();
+        text = text
+          .replace(/\[(BLANK_AUDIO|Music|Applause|Laughter|Silence|noise)\]/gi, '')
+          .replace(/♪[^♪]*♪?/g, '')
+          .replace(/🎵[^🎵]*🎵?/g, '')
+          .replace(/\s{2,}/g, ' ')
           .trim();
+
+        // Drop known Whisper hallucinations (common outputs on music/noise)
+        if (HALLUC_RX.test(text)) return;
 
         if (text && text.length > 3) {
           this.emit('transcript', { room, trackId, handle, nick, text });
